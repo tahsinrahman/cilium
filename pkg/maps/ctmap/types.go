@@ -6,6 +6,7 @@ package ctmap
 import (
 	"context"
 	"fmt"
+	"net/netip"
 	"strings"
 	"unsafe"
 
@@ -423,8 +424,13 @@ func (c *CtEntry) String() string {
 func (c *CtEntry) New() bpf.MapValue { return &CtEntry{} }
 
 type GCRunner interface {
-	// Run runs the oneshot connection tracking garbage collection.
-	Run(filter GCFilter) (int, error)
+	// ScrubIPs removes the conntrack entries of addrs, and any expired entry,
+	// from the global CT maps. Concurrent calls are coalesced: it returns once
+	// a walk that started after the call has completed, or with an error if
+	// ctx is done first or the garbage collector stopped. Invalid addresses
+	// are not filtered out, callers pass valid ones. Errors of the map walks
+	// themselves are only logged.
+	ScrubIPs(ctx context.Context, addrs ...netip.Addr) error
 
 	// Observe4 allows external consumers to observe ongoing GC iterations over CT maps for IPv4 entries.
 	Observe4() stream.Observable[GCEvent]
@@ -437,9 +443,7 @@ type fakeCTMapGC struct{}
 
 func NewFakeGCRunner() GCRunner { return fakeCTMapGC{} }
 
-func (g fakeCTMapGC) Run(filter GCFilter) (int, error) {
-	return 0, nil
-}
+func (g fakeCTMapGC) ScrubIPs(context.Context, ...netip.Addr) error { return nil }
 
 func (g fakeCTMapGC) Observe4() stream.Observable[GCEvent] {
 	return stream.FuncObservable[GCEvent](func(ctx context.Context, next func(event GCEvent), complete func(err error)) {})

@@ -127,6 +127,9 @@ type GC struct {
 	// global CT maps out from under it.
 	stopGC chan struct{}
 	gcWG   sync.WaitGroup
+
+	// scrub serves GCRunner.ScrubIPs. Its loop runs under gcWG.
+	scrub scrubState
 }
 
 func newGC(params parameters) *GC {
@@ -169,6 +172,10 @@ func newGC(params parameters) *GC {
 			// closes the global CT maps; draining here guarantees no BatchLookup
 			// races that close and dereferences a nil map. See the goroutine in
 			// enableWithConfig.
+			//
+			// Stop scrubs first: queued ones are aborted and no scrub loop is
+			// started afterwards. The one running is drained by the wait below.
+			gc.scrub.stop()
 			close(gc.stopGC)
 			drained := make(chan struct{})
 			go func() {
@@ -400,23 +407,6 @@ func (gc *GC) enableWithConfig(
 			gc.calculateCTMapPressure(mapPressureSignalCh)
 		}()
 	}
-}
-
-func (gc *GC) Run(filter ctmap.GCFilter) (int, error) {
-	totalDeleted := 0
-	for _, m := range gc.ctMaps.ActiveMaps() {
-		deleted, err := m.GC(filter, gc.next4, gc.next6)
-		if err != nil {
-			gc.logger.Error("failed to run GC on map",
-				logfields.BPFMapName, m.Name(),
-				logfields.Error, err,
-			)
-		}
-
-		totalDeleted += deleted
-	}
-
-	return totalDeleted, nil
 }
 
 func (gc *GC) Observe4() stream.Observable[ctmap.GCEvent] {

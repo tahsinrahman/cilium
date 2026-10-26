@@ -2844,14 +2844,15 @@ func (e *Endpoint) Delete(conf DeleteConfig) []error {
 	e.unlock()
 
 	// Do not wait or scrub with the endpoint lock held, the walks can take many
-	// seconds. buildMutex is still held, so the scrubs complete before Delete
-	// returns, i.e. before the IP is released. Join the initial scrub first: it
-	// may still be running after a failed regeneration and must not resume
-	// after the IP has been handed to a new endpoint.
+	// seconds. buildMutex is still held, so the scrub completes before Delete
+	// returns, i.e. before the IP is released. Stop cancelled the initial scrub:
+	// join its call so that it cannot be queued after the IP was released.
 	if initialScrub != nil {
 		<-initialScrub
 	}
-	e.scrubIPsInConntrackTable(ctScrubIPs)
+	// Not aliveCtx, Stop cancelled it. It only fails when the agent stops, when
+	// stale entries do not matter.
+	_ = e.ctMapGC.ScrubIPs(context.Background(), ctScrubIPs...)
 
 	return errs
 }

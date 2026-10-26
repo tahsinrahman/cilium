@@ -30,7 +30,6 @@ import (
 	endpointtypes "github.com/cilium/cilium/pkg/endpoint/types"
 	"github.com/cilium/cilium/pkg/loadinfo"
 	"github.com/cilium/cilium/pkg/logging/logfields"
-	"github.com/cilium/cilium/pkg/maps/ctmap"
 	"github.com/cilium/cilium/pkg/maps/policymap"
 	"github.com/cilium/cilium/pkg/metrics"
 	"github.com/cilium/cilium/pkg/option"
@@ -899,12 +898,12 @@ func (e *Endpoint) deleteMaps() []error {
 // none for fake endpoints, and not the IPs for which a non-nil ownsIP returns
 // false, as a new endpoint already owns those and its own create scrub covers
 // them.
-func (e *Endpoint) ctScrubIPsLocked(ownsIP func(netip.Addr) bool) map[ctmap.NetAddr]struct{} {
-	ips := map[ctmap.NetAddr]struct{}{}
+func (e *Endpoint) ctScrubIPsLocked(ownsIP func(netip.Addr) bool) []netip.Addr {
 	if e.isPropertyLocked(endpointtypes.PropertyFakeEndpoint) {
-		return ips
+		return nil
 	}
 
+	var ips []netip.Addr
 	for _, ip := range []netip.Addr{e.IPv4, e.IPv6} {
 		if !ip.IsValid() {
 			continue
@@ -916,23 +915,9 @@ func (e *Endpoint) ctScrubIPsLocked(ownsIP func(netip.Addr) bool) map[ctmap.NetA
 			)
 			continue
 		}
-		ips[ctmap.NetAddr{Addr: ip}] = struct{}{}
+		ips = append(ips, ip)
 	}
 	return ips
-}
-
-// scrubIPsInConntrackTable runs the CTMap garbage collector for the given IPs,
-// also dropping expired entries: the walk visits them anyway. It must not be
-// called with the endpoint lock held, the walk can take many seconds.
-func (e *Endpoint) scrubIPsInConntrackTable(ips map[ctmap.NetAddr]struct{}) {
-	if len(ips) == 0 {
-		return
-	}
-
-	e.ctMapGC.Run(ctmap.GCFilter{
-		RemoveExpired: true,
-		MatchIPs:      ips,
-	})
 }
 
 // ctScrubSkipped is a closed channel for endpoints that must not scrub.
@@ -943,9 +928,9 @@ var ctScrubSkipped = func() <-chan struct{} {
 }()
 
 // startInitialCTScrubLocked returns a channel that is closed once the
-// endpoint's initial conntrack scrub has completed. At most one scrub is ever
-// started per endpoint, later regenerations (e.g. after a failed one) wait on
-// the same channel.
+// endpoint's initial conntrack scrub has completed, or was cancelled when the
+// endpoint stopped. At most one scrub is ever started per endpoint, later
+// regenerations (e.g. after a failed one) wait on the same channel.
 func (e *Endpoint) startInitialCTScrubLocked() <-chan struct{} {
 	if e.ctScrubDone == nil {
 		done := make(chan struct{})
@@ -953,7 +938,10 @@ func (e *Endpoint) startInitialCTScrubLocked() <-chan struct{} {
 		e.ctScrubDone = done
 		go func() {
 			defer close(done)
-			e.scrubIPsInConntrackTable(ips)
+			// If Stop cancelled aliveCtx the scrub returns early, and Delete
+			// joins it and scrubs. The other error is the GC stopping, when
+			// stale entries do not matter. Walk errors are only logged.
+			_ = e.ctMapGC.ScrubIPs(e.aliveCtx, ips...)
 		}()
 	}
 	return e.ctScrubDone

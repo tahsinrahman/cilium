@@ -6,6 +6,7 @@ package endpoint
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net/netip"
@@ -130,35 +131,6 @@ func TestFirstRegenerationComputesPolicyOnce(t *testing.T) {
 	}
 }
 
-type recordingGCRunner struct {
-	ctmap.GCRunner
-	filter ctmap.GCFilter
-}
-
-func (r *recordingGCRunner) Run(filter ctmap.GCFilter) (int, error) {
-	r.filter = filter
-	return 0, nil
-}
-
-func TestScrubIPsInConntrackTableFilter(t *testing.T) {
-	gc := &recordingGCRunner{GCRunner: ctmap.NewFakeGCRunner()}
-	ep := &Endpoint{
-		ctMapGC: gc,
-		IPv4:    netip.MustParseAddr("10.0.0.1"),
-		IPv6:    netip.MustParseAddr("fd00::1"),
-	}
-
-	ep.scrubIPsInConntrackTable(ep.ctScrubIPsLocked(nil))
-
-	require.Equal(t, ctmap.GCFilter{
-		RemoveExpired: true,
-		MatchIPs: map[ctmap.NetAddr]struct{}{
-			{Addr: ep.IPv4}: {},
-			{Addr: ep.IPv6}: {},
-		},
-	}, gc.filter)
-}
-
 // recvOrFail receives from ch, failing the test if nothing arrives in time.
 func recvOrFail[T any](t *testing.T, ch <-chan T, what string) T {
 	t.Helper()
@@ -195,9 +167,10 @@ func requireMutexFree(t *testing.T, e *Endpoint) {
 	recvOrFail(t, locked, "the endpoint mutex")
 }
 
-// gatedGCRunner blocks every Run until the test closes the gate that the Run
-// published on runs, so that each walk is controlled independently. All walks
-// are released when the test ends.
+// gatedGCRunner blocks every ScrubIPs until the test closes the gate that the
+// call published on runs, so that each walk is controlled independently. All
+// walks are released when the test ends, and a call returns the error of its
+// context if that is done first.
 type gatedGCRunner struct {
 	ctmap.GCRunner
 	ctx  context.Context
@@ -212,19 +185,22 @@ func newGatedGCRunner(t *testing.T) *gatedGCRunner {
 	}
 }
 
-func (g *gatedGCRunner) Run(ctmap.GCFilter) (int, error) {
+func (g *gatedGCRunner) ScrubIPs(ctx context.Context, _ ...netip.Addr) error {
 	gate := make(chan struct{})
 	g.runs <- gate
 	select {
 	case <-gate:
 	case <-g.ctx.Done():
+	case <-ctx.Done():
+		return ctx.Err()
 	}
-	return 0, nil
+	return nil
 }
 
 func newCTScrubTestEndpoint(t *testing.T, gc ctmap.GCRunner) *Endpoint {
 	t.Helper()
 	ep := &Endpoint{
+		aliveCtx:   t.Context(),
 		ctMapGC:    gc,
 		IPv4:       netip.MustParseAddr("10.0.0.1"),
 		properties: map[string]any{},
@@ -263,13 +239,6 @@ func TestInitialCTScrubSingleFlight(t *testing.T) {
 
 func TestCTScrubIPsLocked(t *testing.T) {
 	v4, v6 := netip.MustParseAddr("10.0.0.1"), netip.MustParseAddr("fd00::1")
-	set := func(ips ...netip.Addr) map[ctmap.NetAddr]struct{} {
-		s := map[ctmap.NetAddr]struct{}{}
-		for _, ip := range ips {
-			s[ctmap.NetAddr{Addr: ip}] = struct{}{}
-		}
-		return s
-	}
 	owns := func(owned ...netip.Addr) func(netip.Addr) bool {
 		return func(ip netip.Addr) bool { return slices.Contains(owned, ip) }
 	}
@@ -279,13 +248,13 @@ func TestCTScrubIPsLocked(t *testing.T) {
 		fake   bool
 		ipv6   netip.Addr
 		ownsIP func(netip.Addr) bool
-		want   map[ctmap.NetAddr]struct{}
+		want   []netip.Addr
 	}{
-		{name: "nil ownsIP", ipv6: v6, want: set(v4, v6)},
-		{name: "fake endpoint", fake: true, ipv6: v6, want: set()},
-		{name: "invalid IPv6", want: set(v4)},
-		{name: "IPv4 owned by another endpoint", ipv6: v6, ownsIP: owns(v6), want: set(v6)},
-		{name: "all IPs owned by another endpoint", ipv6: v6, ownsIP: owns(), want: set()},
+		{name: "nil ownsIP", ipv6: v6, want: []netip.Addr{v4, v6}},
+		{name: "fake endpoint", fake: true, ipv6: v6},
+		{name: "invalid IPv6", want: []netip.Addr{v4}},
+		{name: "IPv4 owned by another endpoint", ipv6: v6, ownsIP: owns(v6), want: []netip.Addr{v6}},
+		{name: "all IPs owned by another endpoint", ipv6: v6, ownsIP: owns()},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ep := newCTScrubTestEndpoint(t, ctmap.NewFakeGCRunner())
@@ -304,7 +273,7 @@ func (noopLXCMap) DeleteElement(*slog.Logger, lxcmap.EndpointFrontend) []error {
 
 // newCTScrubDeleteEndpoint returns a started, non-fake endpoint that Delete can
 // run on.
-func newCTScrubDeleteEndpoint(t *testing.T, gc *gatedGCRunner) *Endpoint {
+func newCTScrubDeleteEndpoint(t *testing.T, gc ctmap.GCRunner) *Endpoint {
 	t.Helper()
 	// These tests hold buildMutex for longer than the lockdebug threshold, which
 	// is then logged through a logger that is unset in unit tests.
@@ -350,31 +319,73 @@ func TestDeleteScrubsAfterUnlock(t *testing.T) {
 	recvOrFail(t, deleted, "Delete to return")
 }
 
-// Delete must wait for a still running initial scrub before scrubbing and
-// returning: the initial scrub is not stopped by a failed regeneration or by
-// Stop, and must not resume after the IP was handed to a new endpoint.
-func TestDeleteJoinsInitialScrub(t *testing.T) {
+// Delete cancels the initial scrub (Stop cancels the endpoint context) and
+// waits for its call to return, before scrubbing without the endpoint context
+// and returning.
+func TestDeleteCancelsAndJoinsInitialScrub(t *testing.T) {
 	gc := newGatedGCRunner(t)
 	ep := newCTScrubDeleteEndpoint(t, gc)
 
 	ep.unconditionalLock()
 	initial := ep.startInitialCTScrubLocked()
 	ep.unlock()
-	initialGate := recvOrFail(t, gc.runs, "the initial CT walk to start")
+	recvOrFail(t, gc.runs, "the initial CT walk to start")
 
 	deleted := startDelete(t, ep)
 
-	requireQuiet(t, gc.runs, "CT walk")
-	requireMutexFree(t, ep)
-	requireQuiet(t, deleted, "Delete returning")
-
-	close(initialGate)
+	// The initial walk's gate is never released: Delete cancelled it.
 	recvOrFail(t, initial, "the initial scrub")
 	deleteGate := recvOrFail(t, gc.runs, "the delete CT walk to start")
+	requireMutexFree(t, ep)
 	requireQuiet(t, deleted, "Delete returning")
 
 	close(deleteGate)
 	recvOrFail(t, deleted, "Delete to return")
+}
+
+// recordingGCRunner records the context error and addresses of the last
+// scrub, and fails it with err. Read them only once the scrub is finished.
+type recordingGCRunner struct {
+	ctmap.GCRunner
+	err      error
+	ctxErr   error
+	scrubbed []netip.Addr
+}
+
+func (r *recordingGCRunner) ScrubIPs(ctx context.Context, addrs ...netip.Addr) error {
+	r.ctxErr, r.scrubbed = ctx.Err(), addrs
+	return r.err
+}
+
+// The initial scrub passes all the endpoint's IPs, with the alive context.
+func TestInitialCTScrubIPs(t *testing.T) {
+	gc := &recordingGCRunner{GCRunner: ctmap.NewFakeGCRunner()}
+	ep := newCTScrubTestEndpoint(t, gc)
+	ep.IPv6 = netip.MustParseAddr("fd00::1")
+	var cancel context.CancelFunc
+	ep.aliveCtx, cancel = context.WithCancel(t.Context())
+	cancel()
+
+	ep.unconditionalLock()
+	done := ep.startInitialCTScrubLocked()
+	ep.unlock()
+	recvOrFail(t, done, "the initial scrub")
+
+	require.ErrorIs(t, gc.ctxErr, context.Canceled, "the scrub did not use the endpoint context")
+	require.Equal(t, []netip.Addr{ep.IPv4, ep.IPv6}, gc.scrubbed)
+}
+
+// Delete carries on when the scrub fails, and scrubs with a context that Stop
+// did not cancel.
+func TestDeleteScrubIgnoresError(t *testing.T) {
+	gc := &recordingGCRunner{GCRunner: ctmap.NewFakeGCRunner(), err: errors.New("scrub failed")}
+	ep := newCTScrubDeleteEndpoint(t, gc)
+
+	deleted := startDelete(t, ep)
+
+	recvOrFail(t, deleted, "Delete to return")
+	require.NoError(t, gc.ctxErr, "the delete scrub used the endpoint context")
+	require.Equal(t, []netip.Addr{ep.IPv4}, gc.scrubbed)
 }
 
 func TestWriteInformationalComments(t *testing.T) {
