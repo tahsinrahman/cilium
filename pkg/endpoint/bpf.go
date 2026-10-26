@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -471,7 +472,7 @@ func (e *Endpoint) regenerateBPF(regenContext *regenerationContext) (revnum uint
 
 	// Wait for connection tracking cleaning to complete
 	stats.waitingForCTClean.Start()
-	<-datapathRegenCtxt.ctCleaned
+	<-datapathRegenCtxt.ctScrubDone
 	stats.waitingForCTClean.End(true)
 
 	if datapathRegenCtxt.regenerationLevel >= regeneration.RegenerateWithDatapath {
@@ -520,8 +521,6 @@ func (e *Endpoint) regenerateBPF(regenContext *regenerationContext) (revnum uint
 		return 0, err
 	}
 	defer e.unlock()
-
-	e.ctCleaned = true
 
 	if !datapathRegenCtxt.policyMapSyncDone {
 		err = e.policyMapSync(datapathRegenCtxt.policyMapDump, stats)
@@ -668,17 +667,11 @@ func (e *Endpoint) runPreCompilationSteps(regenContext *regenerationContext) (pr
 
 	defer e.unlock()
 
-	// In the first ever regeneration of the endpoint, the conntrack table
-	// is cleaned from the new endpoint IPs as it is guaranteed that any
-	// pre-existing connections using that IP are now invalid.
-	if !e.ctCleaned {
-		go func() {
-			e.scrubIPsInConntrackTable()
-			close(datapathRegenCtxt.ctCleaned)
-		}()
-	} else {
-		close(datapathRegenCtxt.ctCleaned)
-	}
+	// The conntrack table is cleaned from the new endpoint IPs as it is
+	// guaranteed that any pre-existing connections using that IP are now
+	// invalid. The scrub is started at most once per endpoint, later
+	// regenerations wait on the same one.
+	datapathRegenCtxt.ctScrubDone = e.startInitialCTScrubLocked()
 
 	// Set the computed policy as the "incoming" policy. This can fail if
 	// the endpoint's security identity changed during or after policy calculation.
@@ -902,26 +895,59 @@ func (e *Endpoint) deleteMaps() []error {
 	return errors
 }
 
-// scrubIPsInConntrackTableLocked will run the CTMap garbagecollector with the endpoint IPs.
-// Also drop expired entries: the walk visits them anyway.
-func (e *Endpoint) scrubIPsInConntrackTableLocked() {
+// ctScrubIPsLocked returns the IPs whose conntrack entries must be scrubbed:
+// none for fake endpoints.
+func (e *Endpoint) ctScrubIPsLocked() map[ctmap.NetAddr]struct{} {
+	ips := map[ctmap.NetAddr]struct{}{}
 	if e.isPropertyLocked(endpointtypes.PropertyFakeEndpoint) {
+		return ips
+	}
+
+	for _, ip := range []netip.Addr{e.IPv4, e.IPv6} {
+		if !ip.IsValid() {
+			continue
+		}
+		ips[ctmap.NetAddr{Addr: ip}] = struct{}{}
+	}
+	return ips
+}
+
+// scrubIPsInConntrackTable runs the CTMap garbage collector for the given IPs,
+// also dropping expired entries: the walk visits them anyway. It must not be
+// called with the endpoint lock held, the walk can take many seconds.
+func (e *Endpoint) scrubIPsInConntrackTable(ips map[ctmap.NetAddr]struct{}) {
+	if len(ips) == 0 {
 		return
 	}
 
 	e.ctMapGC.Run(ctmap.GCFilter{
 		RemoveExpired: true,
-		MatchIPs: map[ctmap.NetAddr]struct{}{
-			{Addr: e.IPv4}: {},
-			{Addr: e.IPv6}: {},
-		},
+		MatchIPs:      ips,
 	})
 }
 
-func (e *Endpoint) scrubIPsInConntrackTable() {
-	e.unconditionalLock()
-	e.scrubIPsInConntrackTableLocked()
-	e.unlock()
+// ctScrubSkipped is a closed channel for endpoints that must not scrub.
+var ctScrubSkipped = func() <-chan struct{} {
+	c := make(chan struct{})
+	close(c)
+	return c
+}()
+
+// startInitialCTScrubLocked returns a channel that is closed once the
+// endpoint's initial conntrack scrub has completed. At most one scrub is ever
+// started per endpoint, later regenerations (e.g. after a failed one) wait on
+// the same channel.
+func (e *Endpoint) startInitialCTScrubLocked() <-chan struct{} {
+	if e.ctScrubDone == nil {
+		done := make(chan struct{})
+		ips := e.ctScrubIPsLocked()
+		e.ctScrubDone = done
+		go func() {
+			defer close(done)
+			e.scrubIPsInConntrackTable(ips)
+		}()
+	}
+	return e.ctScrubDone
 }
 
 // SkipStateClean can be called on a endpoint before its first build to skip
@@ -933,7 +959,9 @@ func (e *Endpoint) scrubIPsInConntrackTable() {
 func (e *Endpoint) SkipStateClean() {
 	// Mark conntrack as already cleaned
 	e.unconditionalLock()
-	e.ctCleaned = true
+	if e.ctScrubDone == nil {
+		e.ctScrubDone = ctScrubSkipped
+	}
 	e.unlock()
 }
 

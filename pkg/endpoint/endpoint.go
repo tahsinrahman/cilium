@@ -396,9 +396,10 @@ type Endpoint struct {
 	// other resources
 	controllers *controller.Manager
 
-	// ctCleaned indicates whether the conntrack table has already been
-	// cleaned when this endpoint was first created
-	ctCleaned bool
+	// ctScrubDone is closed once the endpoint's initial conntrack scrub has
+	// completed or was skipped. Nil until the first regeneration starts it,
+	// never reset. Protected by the endpoint mutex.
+	ctScrubDone <-chan struct{}
 
 	hasBPFProgram chan struct{}
 
@@ -1355,8 +1356,6 @@ func (e *Endpoint) leaveLocked(conf DeleteConfig) []error {
 	e.removeDirectories()
 	e.controllers.RemoveAll()
 	e.cleanPolicySignals()
-
-	e.scrubIPsInConntrackTableLocked()
 
 	e.setState(StateDisconnected, "Endpoint removed")
 
@@ -2840,7 +2839,19 @@ func (e *Endpoint) Delete(conf DeleteConfig) []error {
 	}
 
 	errs = append(errs, e.leaveLocked(conf)...)
+	ctScrubIPs := e.ctScrubIPsLocked()
+	initialScrub := e.ctScrubDone
 	e.unlock()
+
+	// Do not wait or scrub with the endpoint lock held, the walks can take many
+	// seconds. buildMutex is still held, so the scrubs complete before Delete
+	// returns, i.e. before the IP is released. Join the initial scrub first: it
+	// may still be running after a failed regeneration and must not resume
+	// after the IP has been handed to a new endpoint.
+	if initialScrub != nil {
+		<-initialScrub
+	}
+	e.scrubIPsInConntrackTable(ctScrubIPs)
 
 	return errs
 }

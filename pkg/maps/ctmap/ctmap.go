@@ -437,7 +437,7 @@ func (m *Map) doGCForFamily(filter GCFilter, next4, next6 func(GCEvent), ipv6 bo
 	// We serialize the deletions in order to avoid forced map walk restarts
 	// when keys are being evicted underneath us from concurrent goroutines.
 	// Thus globalDeleteLock must be held while performing cleanip sweep
-	// otherwise (*Endpoint).scrubIPsInConntrackTableLocked() may cause deletes
+	// otherwise (*Endpoint).scrubIPsInConntrackTable() may cause deletes
 	// to happen concurrently.
 	globalDeleteLock[m.mapType].Lock()
 	if filter.RemoveExpired && filter.Time == 0 {

@@ -130,7 +130,6 @@ func ParseExternalRegenerationMetadata(ctx context.Context, logger *slog.Logger,
 		Reason: e.Reason,
 		datapathRegenerationContext: &datapathRegenerationContext{
 			regenerationLevel: e.RegenerationLevel,
-			ctCleaned:         make(chan struct{}),
 
 			policyRevisionToWaitFor: e.PolicyRevisionToWaitFor,
 		},
@@ -146,7 +145,7 @@ type datapathRegenerationContext struct {
 	bpfHeaderfilesHash string
 	epInfoCache        *epInfoCache
 	proxyWaitGroup     *completion.WaitGroup
-	ctCleaned          chan struct{}
+	ctScrubDone        <-chan struct{}
 	completionCtx      context.Context
 	completionCancel   context.CancelFunc
 	currentDir         string
