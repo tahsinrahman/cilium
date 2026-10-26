@@ -2839,7 +2839,7 @@ func (e *Endpoint) Delete(conf DeleteConfig) []error {
 	}
 
 	errs = append(errs, e.leaveLocked(conf)...)
-	ctScrubIPs := e.ctScrubIPsLocked()
+	ctScrubIPs := e.ctScrubIPsLocked(conf.EndpointOwnsIP)
 	initialScrub := e.ctScrubDone
 	e.unlock()
 

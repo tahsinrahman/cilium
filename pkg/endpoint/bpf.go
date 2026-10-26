@@ -896,8 +896,10 @@ func (e *Endpoint) deleteMaps() []error {
 }
 
 // ctScrubIPsLocked returns the IPs whose conntrack entries must be scrubbed:
-// none for fake endpoints.
-func (e *Endpoint) ctScrubIPsLocked() map[ctmap.NetAddr]struct{} {
+// none for fake endpoints, and not the IPs for which a non-nil ownsIP returns
+// false, as a new endpoint already owns those and its own create scrub covers
+// them.
+func (e *Endpoint) ctScrubIPsLocked(ownsIP func(netip.Addr) bool) map[ctmap.NetAddr]struct{} {
 	ips := map[ctmap.NetAddr]struct{}{}
 	if e.isPropertyLocked(endpointtypes.PropertyFakeEndpoint) {
 		return ips
@@ -905,6 +907,13 @@ func (e *Endpoint) ctScrubIPsLocked() map[ctmap.NetAddr]struct{} {
 
 	for _, ip := range []netip.Addr{e.IPv4, e.IPv6} {
 		if !ip.IsValid() {
+			continue
+		}
+		if ownsIP != nil && !ownsIP(ip) {
+			e.getLogger().Info(
+				"Skipping conntrack scrub: IP is no longer owned by this endpoint",
+				logfields.IPAddr, ip,
+			)
 			continue
 		}
 		ips[ctmap.NetAddr{Addr: ip}] = struct{}{}
@@ -940,7 +949,7 @@ var ctScrubSkipped = func() <-chan struct{} {
 func (e *Endpoint) startInitialCTScrubLocked() <-chan struct{} {
 	if e.ctScrubDone == nil {
 		done := make(chan struct{})
-		ips := e.ctScrubIPsLocked()
+		ips := e.ctScrubIPsLocked(nil)
 		e.ctScrubDone = done
 		go func() {
 			defer close(done)

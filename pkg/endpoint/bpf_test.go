@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/netip"
 	"os"
+	"slices"
 	"testing"
 	"time"
 
@@ -147,7 +148,7 @@ func TestScrubIPsInConntrackTableFilter(t *testing.T) {
 		IPv6:    netip.MustParseAddr("fd00::1"),
 	}
 
-	ep.scrubIPsInConntrackTable(ep.ctScrubIPsLocked())
+	ep.scrubIPsInConntrackTable(ep.ctScrubIPsLocked(nil))
 
 	require.Equal(t, ctmap.GCFilter{
 		RemoveExpired: true,
@@ -269,23 +270,29 @@ func TestCTScrubIPsLocked(t *testing.T) {
 		}
 		return s
 	}
+	owns := func(owned ...netip.Addr) func(netip.Addr) bool {
+		return func(ip netip.Addr) bool { return slices.Contains(owned, ip) }
+	}
 
 	for _, tc := range []struct {
-		name string
-		fake bool
-		ipv6 netip.Addr
-		want map[ctmap.NetAddr]struct{}
+		name   string
+		fake   bool
+		ipv6   netip.Addr
+		ownsIP func(netip.Addr) bool
+		want   map[ctmap.NetAddr]struct{}
 	}{
-		{name: "IPv4 and IPv6", ipv6: v6, want: set(v4, v6)},
+		{name: "nil ownsIP", ipv6: v6, want: set(v4, v6)},
 		{name: "fake endpoint", fake: true, ipv6: v6, want: set()},
 		{name: "invalid IPv6", want: set(v4)},
+		{name: "IPv4 owned by another endpoint", ipv6: v6, ownsIP: owns(v6), want: set(v6)},
+		{name: "all IPs owned by another endpoint", ipv6: v6, ownsIP: owns(), want: set()},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ep := newCTScrubTestEndpoint(t, ctmap.NewFakeGCRunner())
 			ep.IPv6 = tc.ipv6
 			ep.SetPropertyValue(endpointtypes.PropertyFakeEndpoint, tc.fake)
 
-			require.Equal(t, tc.want, ep.ctScrubIPsLocked())
+			require.Equal(t, tc.want, ep.ctScrubIPsLocked(tc.ownsIP))
 		})
 	}
 }
